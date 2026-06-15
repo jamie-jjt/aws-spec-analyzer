@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Spec Analyzer & BOM Builder</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<header class="app-header">
+  <div class="header-inner">
+    <div class="logo">
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect width="32" height="32" rx="6" fill="#FF9900"/>
+        <path d="M8 22l4-12h2l4 12h-2l-1-3h-4l-1 3H8zm3.5-5h3l-1.5-5-1.5 5z" fill="#232F3E"/>
+        <path d="M20 10h6v2h-6v-2zm0 5h6v2h-6v-2zm0 5h6v2h-6v-2z" fill="#232F3E"/>
+      </svg>
+      <span class="logo-text">AWS <strong>Spec Analyzer</strong></span>
+    </div>
+    <p class="header-tagline">Upload any technical spec → Get AWS service recommendations + BOM</p>
+  </div>
+</header>
+
+<!-- ── Main ─────────────────────────────────────────────────────────────── -->
+<main class="container">
+
+  <!-- Step 1: Upload / Paste -->
+  <section class="card" id="upload-section">
+    <h2 class="card-title">
+      <span class="step-badge">1</span>
+      Upload Technical Specification
+    </h2>
+
+    <div class="tabs" role="tablist">
+      <button class="tab active" role="tab" aria-selected="true" data-tab="file">📄 Upload File</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="text">✏️ Paste Text</button>
+    </div>
+
+    <!-- File Upload Tab -->
+    <div class="tab-panel" id="tab-file">
+      <div class="drop-zone" id="drop-zone" tabindex="0" role="button"
+           aria-label="Click or drag a file here to upload">
+        <div class="drop-icon">📁</div>
+        <p class="drop-label">Drag & drop your specification file here</p>
+        <p class="drop-sub">or click to browse</p>
+        <p class="drop-types">Supports: PDF, DOCX, TXT, CSV, JSON, YAML, XLSX, MD, PNG, JPG/JPEG and more</p>
+        <input type="file" id="file-input" class="sr-only"
+               accept=".pdf,.docx,.doc,.txt,.csv,.json,.yaml,.yml,.xlsx,.xls,.md,.rst,.log,.conf,.ini,.toml,.png,.jpg,.jpeg,.bmp,.tiff,.tif,.webp"
+               aria-label="Choose specification file" />
+      </div>
+      <div class="file-selected hidden" id="file-selected-info">
+        <span class="file-icon">📎</span>
+        <span id="selected-filename"></span>
+        <button class="btn-icon" id="clear-file" aria-label="Clear file">✕</button>
+      </div>
+    </div>
+
+    <!-- Text Paste Tab -->
+    <div class="tab-panel hidden" id="tab-text">
+      <textarea id="text-input" rows="10"
+        placeholder="Paste your technical specification here...
+
+Examples:
+• On-premises: 8x physical servers with 32 vCPUs, 256GB RAM, 50TB NAS storage
+• Azure: AKS cluster with 10 nodes, Azure SQL Database, Azure Blob Storage 10TB
+• GCP: GKE cluster, BigQuery data warehouse, Cloud Storage 5TB
+• Generic: Web application needing 4 vCPUs, 16GB RAM, PostgreSQL database, CDN"
+        aria-label="Paste specification text"></textarea>
+    </div>
+
+    <!-- Project Name & Region -->
+    <div class="form-row">
+      <label for="project-name" class="form-label">Project Name</label>
+      <input type="text" id="project-name" class="form-input"
+             placeholder="e.g. E-Commerce Platform Migration"
+             value="AWS BOM" aria-label="Project name for export" />
+    </div>
+
+    <div class="form-row">
+      <label for="region-select" class="form-label">AWS Region</label>
+      <select id="region-select" class="form-input" aria-label="Target AWS region">
+        <!-- populated by JS from REGIONS constant -->
+      </select>
+    </div>
+
+    <div class="action-row">
+      <button class="btn btn-primary" id="analyze-btn" disabled>
+        <span class="btn-icon-l">🔍</span> Analyze Specification
+      </button>
+    </div>
+  </section>
+
+  <!-- Loading state -->
+  <div class="loading hidden" id="loading" aria-live="polite" aria-busy="true">
+    <div class="spinner" aria-hidden="true"></div>
+    <p>Analyzing specification and mapping to AWS services…</p>
+  </div>
+
+  <!-- Error state -->
+  <div class="alert alert-error hidden" id="error-box" role="alert">
+    <strong>Error:</strong> <span id="error-message"></span>
+  </div>
+
+  <!-- Step 2: Analysis Result -->
+  <section class="card hidden" id="result-section">
+    <h2 class="card-title">
+      <span class="step-badge">2</span>
+      Analysis Result
+    </h2>
+
+    <div class="result-meta" id="result-meta">
+      <!-- populated by JS -->
+    </div>
+
+    <div class="missing-info-box hidden" id="missing-info-box">
+      <h3>❓ Additional Information Needed</h3>
+      <div id="missing-info-list"></div>
+    </div>
+  </section>
+
+  <!-- Step 3: BOM Builder -->
+  <section class="card hidden" id="bom-section">
+    <h2 class="card-title">
+      <span class="step-badge">3</span>
+      Bill of Materials (BOM)
+      <span class="bom-total-badge" id="bom-total-badge">$0.00 / mo</span>
+    </h2>
+
+    <p class="bom-intro">
+      Review and customize each AWS service. Adjust quantities, types, and pricing models, then export.
+    </p>
+
+    <div class="bom-toolbar">
+      <button class="btn btn-add-service" id="add-service-btn">
+        <span>＋</span> Add Service
+      </button>
+    </div>
+
+    <div id="bom-table-wrapper">
+      <!-- BOM rows populated by JS -->
+    </div>
+
+    <!-- Totals -->
+    <div class="bom-totals" id="bom-totals">
+      <div class="total-row">
+        <span>Estimated Monthly Total:</span>
+        <strong id="total-monthly">$0.00</strong>
+      </div>
+      <div class="total-row total-annual">
+        <span>Estimated Annual Total (×12):</span>
+        <strong id="total-annual">$0.00</strong>
+      </div>
+      <p class="price-disclaimer">
+        ⚠️ Prices are estimates based on public AWS on-demand rates (us-east-1).
+        Verify with the <a href="https://calculator.aws/pricing/2/home" target="_blank" rel="noopener">official AWS Pricing Calculator</a>.
+      </p>
+    </div>
+
+    <!-- Step 4: Export -->
+    <div class="export-bar">
+      <h3 class="export-title">
+        <span class="step-badge">4</span>
+        Export BOM
+      </h3>
+      <div class="export-actions">
+        <button class="btn btn-secondary" id="export-csv-btn">
+          ⬇ Export CSV
+        </button>
+        <button class="btn btn-secondary" id="export-excel-btn">
+          ⬇ Export Excel (.xlsx)
+        </button>
+        <a class="btn btn-outline" href="https://calculator.aws/#/createCalculator"
+           target="_blank" rel="noopener">
+          🔗 Open AWS Pricing Calculator
+        </a>
+      </div>
+      <p class="export-note">
+        The Excel export includes a styled BOM sheet, service details sheet, and pricing disclaimer.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ── Comparative Report ─────────────────────────────────────────────── -->
+<section class="container" id="compare-section" style="display:none;">
+  <div class="card">
+    <h2 class="card-title">
+      <span class="step-badge">📊</span>
+      Comparative Report — Original Spec vs AWS Services
+    </h2>
+    <p class="bom-intro">
+      Side-by-side view of what was in the original specification and the equivalent AWS service selected.
+    </p>
+    <div class="compare-table-wrap">
+      <table class="compare-table" id="compare-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Category</th>
+            <th>Original Specification</th>
+            <th>→</th>
+            <th>AWS Service</th>
+            <th>Selected SKU / Type</th>
+            <th>Pricing Model</th>
+            <th>Est. Monthly (USD)</th>
+            <th>Confidence</th>
+          </tr>
+        </thead>
+        <tbody id="compare-tbody"></tbody>
+        <tfoot>
+          <tr class="compare-total-row">
+            <td colspan="7" style="text-align:right;font-weight:700;">Total Monthly Estimate</td>
+            <td id="compare-total-monthly" style="font-weight:700;"></td>
+            <td></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── Add Service Modal ──────────────────────────────────────────────── -->
+<div class="modal-backdrop hidden" id="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Add AWS Service</h3>
+      <button class="modal-close" id="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-grid">
+        <div class="mctrl-group">
+          <label class="ctrl-label">Category</label>
+          <select class="ctrl-input" id="m-category">
+            <option>Compute</option>
+            <option>Storage</option>
+            <option>Database</option>
+            <option>Networking</option>
+            <option>Containers</option>
+            <option>Serverless/API</option>
+            <option>Analytics/Data</option>
+            <option>GPU/ML</option>
+            <option>Security/Identity</option>
+            <option>Other</option>
+          </select>
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">AWS Service Name</label>
+          <select class="ctrl-input" id="m-service">
+            <!-- populated by category change -->
+          </select>
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">Service Type / SKU</label>
+          <input type="text" class="ctrl-input" id="m-sku" placeholder="e.g. m7g.xlarge" />
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">Quantity</label>
+          <input type="number" class="ctrl-input" id="m-qty" min="1" value="1" />
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">Unit</label>
+          <input type="text" class="ctrl-input" id="m-unit" placeholder="e.g. instance" value="instance" />
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">Pricing Model</label>
+          <select class="ctrl-input" id="m-pricing">
+            <option>On-Demand</option>
+            <option>Spot</option>
+            <option>Reserved 1yr</option>
+            <option>Reserved 3yr</option>
+            <option>Savings Plans</option>
+            <option>Graviton (ARM)</option>
+            <option>Pay-per-use</option>
+          </select>
+        </div>
+        <div class="mctrl-group">
+          <label class="ctrl-label">Est. Monthly Cost (USD)</label>
+          <input type="number" class="ctrl-input" id="m-cost" min="0" step="0.01" placeholder="0.00" />
+        </div>
+        <div class="mctrl-group mctrl-full">
+          <label class="ctrl-label">Notes / Description</label>
+          <input type="text" class="ctrl-input" id="m-notes" placeholder="e.g. Manually added — file server replacement" />
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="modal-confirm">Add to BOM</button>
+      <button class="btn btn-outline" id="modal-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── BOM Row Template ───────────────────────────────────────────────── -->
+<template id="bom-row-template">
+  <div class="bom-row" data-index="">
+    <div class="bom-row-header">
+      <span class="bom-category-badge"></span>
+      <span class="bom-service-name"></span>
+      <span class="bom-confidence confidence-high"></span>
+      <button class="bom-toggle" aria-expanded="false" aria-label="Expand row">▼</button>
+      <button class="bom-remove" aria-label="Remove this service" title="Remove service">✕</button>
+    </div>
+
+    <div class="bom-row-body collapsed">
+      <div class="bom-spec-text"></div>
+
+      <div class="bom-controls">
+        <!-- Quantity -->
+        <div class="ctrl-group">
+          <label class="ctrl-label">Quantity</label>
+          <input type="number" class="ctrl-input ctrl-qty" min="1" max="9999" value="1"
+                 aria-label="Quantity" />
+        </div>
+
+        <!-- Instance / Service Type -->
+        <div class="ctrl-group ctrl-wide">
+          <label class="ctrl-label">Service Type / SKU</label>
+          <select class="ctrl-input ctrl-type" aria-label="Service type">
+            <!-- options added by JS -->
+          </select>
+        </div>
+
+        <!-- Pricing Model -->
+        <div class="ctrl-group ctrl-wide">
+          <label class="ctrl-label">Pricing Model</label>
+          <select class="ctrl-input ctrl-pricing" aria-label="Pricing model">
+            <!-- options added by JS -->
+          </select>
+        </div>
+
+        <!-- Region -->
+        <div class="ctrl-group ctrl-wide">
+          <label class="ctrl-label">AWS Region</label>
+          <select class="ctrl-input ctrl-region" aria-label="AWS region">
+            <option value="us-east-1">us-east-1 (N. Virginia)</option>
+            <option value="us-east-2">us-east-2 (Ohio)</option>
+            <option value="us-west-1">us-west-1 (N. California)</option>
+            <option value="us-west-2">us-west-2 (Oregon)</option>
+            <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+            <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
+            <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+            <option value="ap-south-1">ap-south-1 (Mumbai)</option>
+            <option value="eu-west-1">eu-west-1 (Ireland)</option>
+            <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+            <option value="sa-east-1">sa-east-1 (São Paulo)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Alternatives -->
+      <div class="alts-section">
+        <p class="alts-title">Alternative Options:</p>
+        <div class="alts-list"></div>
+      </div>
+
+      <!-- Missing info -->
+      <div class="row-missing hidden">
+        <p class="missing-label">⚠️ Missing info:</p>
+        <ul class="missing-items"></ul>
+      </div>
+
+      <!-- Cost preview -->
+      <div class="cost-preview">
+        <span>Estimated cost for this item:</span>
+        <strong class="item-cost">$0.00 / mo</strong>
+        <a class="calc-link" href="#" target="_blank" rel="noopener">Open in AWS Calculator ↗</a>
+      </div>
+    </div>
+  </div>
+</template>
+
+<footer class="app-footer">
+  <p>
+    AWS Spec Analyzer — Local tool for internal use.
+    Pricing estimates based on public AWS rates and are for guidance only.
+    Always verify with the <a href="https://calculator.aws/pricing/2/home" target="_blank" rel="noopener">official AWS Pricing Calculator</a>.
+  </p>
+</footer>
+
+<script src="/static/app.js?v=5"></script>
+</body>
+</html>
