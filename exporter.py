@@ -30,20 +30,29 @@ def build_bom_rows(mappings: list, project_name: str = "AWS BOM") -> list:
     """Convert mapping dicts (as edited by user) into flat BOM rows."""
     rows = []
     for m in mappings:
-        monthly = float(m.get("selected_monthly_usd", m.get("monthly_estimate_usd", 0)))
-        qty = int(m.get("selected_quantity", m.get("quantity", 1)))
+        try:
+            monthly = float(m.get("selected_monthly_usd") or m.get("monthly_estimate_usd") or 0)
+        except (TypeError, ValueError):
+            monthly = 0.0
+        try:
+            qty = int(m.get("selected_quantity") or m.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
         total_monthly = monthly  # already includes quantity from mapping
+        notes_val = str(m.get("notes", "") or "")
+        if len(notes_val) > 32000:
+            notes_val = notes_val[:32000] + "..."
         rows.append({
-            "Category": m.get("category", ""),
-            "AWS Service": m.get("service_name", ""),
-            "Service Type / SKU": m.get("selected_type", m.get("recommended_type", "")),
+            "Category": str(m.get("category", "")),
+            "AWS Service": str(m.get("service_name", "")),
+            "Service Type / SKU": str(m.get("selected_type") or m.get("recommended_type") or ""),
             "Quantity": qty,
-            "Unit": m.get("unit", ""),
-            "Pricing Model": m.get("selected_pricing", "On-Demand"),
+            "Unit": str(m.get("unit", "")),
+            "Pricing Model": str(m.get("selected_pricing", "On-Demand")),
             "Monthly Cost (USD)": round(total_monthly, 2),
             "Annual Cost (USD)": round(total_monthly * 12, 2),
-            "Notes / Source Spec": m.get("notes", ""),
-            "AWS Calculator URL": m.get("aws_calculator_url", ""),
+            "Notes / Source Spec": notes_val,
+            "AWS Calculator URL": str(m.get("aws_calculator_url", "")),
         })
     return rows
 
@@ -167,7 +176,7 @@ def export_excel(mappings: list, project_name: str = "AWS BOM", region: str = "u
         cell.alignment = Alignment(vertical="center")
         if col_name in ("Monthly Cost (USD)", "Annual Cost (USD)"):
             cell.number_format = '"$"#,##0.00'
-            cell.alignment = Alignment(horizontal="right", vertical="center", bold=True)
+            cell.alignment = Alignment(horizontal="right", vertical="center")
 
     # ── Summary cost box ──────────────────────────────────────────────────────
     summary_row = total_row + 2
@@ -213,19 +222,26 @@ def export_excel(mappings: list, project_name: str = "AWS BOM", region: str = "u
     ws_detail.row_dimensions[1].height = 22
 
     for row_idx, m in enumerate(mappings, start=2):
+        alts_list = m.get("alternatives", []) or []
         alts = "; ".join(
             f"{a.get('label', '')} ({a.get('type', '')})"
-            for a in m.get("alternatives", [])
+            for a in alts_list
+            if isinstance(a, dict)
         )
-        missing = "; ".join(m.get("missing_info", []))
+        missing_list = m.get("missing_info", []) or []
+        missing = "; ".join(str(x) for x in missing_list if x)
+        notes_val = m.get("notes", "") or ""
+        # Truncate very long strings for Excel compatibility
+        if len(notes_val) > 32000:
+            notes_val = notes_val[:32000] + "..."
         detail_row = [
-            m.get("category", ""),
-            m.get("service_name", ""),
-            m.get("selected_type", m.get("recommended_type", "")),
+            str(m.get("category", "")),
+            str(m.get("service_name", "")),
+            str(m.get("selected_type", m.get("recommended_type", ""))),
             alts,
-            m.get("confidence", ""),
+            str(m.get("confidence", "")),
             missing,
-            m.get("notes", ""),
+            notes_val,
         ]
         bg = ALT_ROW if row_idx % 2 == 0 else WHITE
         for col_idx, val in enumerate(detail_row, start=1):

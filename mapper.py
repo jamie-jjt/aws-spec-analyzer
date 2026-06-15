@@ -827,8 +827,29 @@ def _translate_vendor_terms(text: str) -> str:
 
 
 def _extract_requirements(original_text: str, translated_text: str, platform: str) -> List[SpecRequirement]:
+    """
+    Intelligently extract infrastructure requirements from spec text.
+    
+    Key principles:
+    - Only create separate service categories when the spec EXPLICITLY requires them
+    - Disk space attached to a server is NOT a separate storage requirement
+    - Basic network connectivity (IPs, bandwidth < 100 Mbps) is NOT a separate networking service
+    - Keywords like "docker" or "container" in a description don't mean container orchestration is needed
+    - GPU mentioned in passing doesn't mean GPU instances are needed
+    - Detect SaaS/application patterns that don't map to raw AWS infrastructure
+    """
     requirements = []
     text_lower = original_text.lower()
+
+    # ── SaaS / Application Detection ─────────────────────────────────────────
+    # If the spec describes a SaaS product/application (not infrastructure), flag it
+    saas_indicators = ["saas", "software as a service", "subscription", "per user", "per seat",
+                       "monthly subscription", "annual license", "cloud-hosted application",
+                       "managed service", "fully managed"]
+    saas_score = sum(1 for kw in saas_indicators if kw in text_lower)
+    
+    # If spec is primarily about a SaaS product, add a note but still try to extract infra
+    is_saas_spec = saas_score >= 2
 
     # ── Compute ───────────────────────────────────────────────────────────────
     vcpu_count = 0
@@ -859,7 +880,8 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
             except (ValueError, IndexError):
                 pass
 
-    if vcpu_count > 0 or ram_gb > 0 or instance_count > 1 or _has_compute_keywords(text_lower):
+    has_compute = vcpu_count > 0 or ram_gb > 0 or instance_count > 1
+    if has_compute:
         req = SpecRequirement(
             category="Compute",
             raw_description=_extract_context(original_text, ["server", "compute", "cpu", "vcpu", "instance", "vm", "node"]),
@@ -874,9 +896,13 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── Storage ───────────────────────────────────────────────────────────────
+    # ONLY create a separate storage requirement if the spec explicitly asks for
+    # standalone/shared/external storage (NAS, SAN, S3, object storage, etc.)
+    # Local disk space on a server does NOT count as a separate storage service.
     storage_tb = 0
     iops = 0
     storage_type = "general"
+    is_standalone_storage = False
 
     for pattern in STORAGE_PATTERNS:
         matches = re.findall(pattern, text_lower)
@@ -895,6 +921,19 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
                 except (ValueError, IndexError):
                     pass
 
+    # Determine if storage is standalone (separate service) or just local disk
+    standalone_storage_keywords = ["object storage", "blob", "s3", "nas", "nfs", "san",
+                                   "shared storage", "file share", "backup storage",
+                                   "archive", "glacier", "data lake", "efs", "fsx"]
+    local_disk_keywords = ["disk space", "disk:", "local disk", "root volume", "boot disk"]
+
+    if any(kw in text_lower for kw in standalone_storage_keywords):
+        is_standalone_storage = True
+    elif storage_tb > 5:  # More than 5 TB suggests dedicated storage
+        is_standalone_storage = True
+    elif iops > 10000:  # High IOPS suggests dedicated storage
+        is_standalone_storage = True
+
     if "object storage" in text_lower or "blob" in text_lower or "s3" in text_lower:
         storage_type = "object"
     elif "block storage" in text_lower or "san" in text_lower or "ebs" in text_lower:
@@ -904,7 +943,8 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
     elif "archive" in text_lower or "backup" in text_lower or "glacier" in text_lower or "tape" in text_lower:
         storage_type = "archive"
 
-    if storage_tb > 0 or iops > 0 or _has_storage_keywords(text_lower):
+    # Only add storage as a separate service if it's clearly standalone
+    if is_standalone_storage:
         req = SpecRequirement(
             category="Storage",
             raw_description=_extract_context(original_text, ["storage", "disk", "san", "nas", "s3", "ebs", "backup"]),
@@ -929,27 +969,42 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
             if engine and engine not in db_engines:
                 db_engines.append(engine)
 
-    # Also check translated text for database services
-    db_keywords = ["database", "rds", "dynamodb", "aurora", "oracle", "sql server", "postgresql",
-                   "mysql", "mongodb", "redis", "cassandra", "elasticsearch"]
-    if any(kw in text_lower for kw in db_keywords):
+    # Only add database if an engine is explicitly mentioned (not just the word "database")
+    # If the spec says "Database: MongoDB" that's explicit.
+    # If it just says "database" generically with no engine, check context more carefully.
+    explicit_db_engines = ["postgresql", "postgres", "mysql", "mariadb", "oracle",
+                           "sql server", "mssql", "mongodb", "redis", "cassandra",
+                           "elasticsearch", "dynamodb"]
+    
+    has_explicit_db = any(eng in text_lower for eng in explicit_db_engines)
+    
+    if has_explicit_db:
+        # Only add engines we actually found explicitly
         if not db_engines:
-            db_engines = ["unspecified"]
-
-    for engine in db_engines:
-        req = SpecRequirement(
-            category="Database",
-            raw_description=_extract_context(original_text, ["database", "db", engine, "rds", "aurora"]),
-            quantity=1,
-            unit="instance",
-            value=0,
-            source_platform=platform,
-            notes=f"Engine: {engine}"
-        )
-        req._db_engine = engine
-        requirements.append(req)
+            # Re-scan for explicit engines
+            for eng in explicit_db_engines:
+                if eng in text_lower:
+                    normalized = eng.replace("postgres", "postgresql") if eng == "postgres" else eng
+                    if normalized not in db_engines:
+                        db_engines.append(normalized)
+        
+        for engine in db_engines:
+            req = SpecRequirement(
+                category="Database",
+                raw_description=_extract_context(original_text, ["database", "db", engine]),
+                quantity=1,
+                unit="instance",
+                value=0,
+                source_platform=platform,
+                notes=f"Engine: {engine}"
+            )
+            req._db_engine = engine
+            requirements.append(req)
 
     # ── Networking ────────────────────────────────────────────────────────────
+    # ONLY create networking requirement for EXPLICIT networking services
+    # (load balancer, CDN, VPN, firewall, etc.)
+    # Basic connectivity (IP address, 10 Mbps bandwidth) is NOT a networking service.
     bandwidth_gbps = 0
     for pattern in NETWORK_PATTERNS:
         matches = re.findall(pattern, text_lower)
@@ -967,9 +1022,14 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
                 except (ValueError, IndexError):
                     pass
 
-    net_keywords = ["load balancer", "cdn", "cloudfront", "vpn", "direct connect", "firewall",
-                    "waf", "route 53", "dns", "nat gateway", "transit gateway"]
-    if bandwidth_gbps > 0 or any(kw in text_lower for kw in net_keywords):
+    # Only add networking if there's a specific networking SERVICE mentioned
+    # (not just basic connectivity like "10 Mbps" or "1 IPv4")
+    explicit_net_services = ["load balancer", "cdn", "cloudfront", "vpn", "direct connect",
+                             "firewall", "waf", "transit gateway", "nat gateway"]
+    has_explicit_net_service = any(kw in text_lower for kw in explicit_net_services)
+    has_significant_bandwidth = bandwidth_gbps >= 1.0  # >= 1 Gbps suggests dedicated networking
+
+    if has_explicit_net_service or has_significant_bandwidth:
         req = SpecRequirement(
             category="Networking",
             raw_description=_extract_context(original_text, ["network", "bandwidth", "load balancer", "cdn", "vpn", "firewall"]),
@@ -983,13 +1043,16 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── GPU / AI / ML ─────────────────────────────────────────────────────────
-    has_gpu = False
+    # ONLY add GPU if spec EXPLICITLY requires GPU instances or ML training/inference
+    # Mentioning "AI" or "machine learning" in a feature description doesn't mean GPU is needed
     gpu_count = 0
     gpu_model = ""
-    for pattern in GPU_PATTERNS:
+    has_explicit_gpu_requirement = False
+
+    for pattern in GPU_PATTERNS[:2]:  # Only the numeric GPU patterns (not keyword-only)
         matches = re.findall(pattern, text_lower)
         if matches:
-            has_gpu = True
+            has_explicit_gpu_requirement = True
             for m in matches:
                 try:
                     gpu_count = max(gpu_count, int(m))
@@ -1000,9 +1063,17 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
     for model in gpu_models:
         if model in text_lower:
             gpu_model = model
+            has_explicit_gpu_requirement = True
             break
 
-    if has_gpu or any(kw in text_lower for kw in ["machine learning", "deep learning", "ai inference", "llm", "training workload"]):
+    # Only trigger GPU category if there's an explicit GPU count, GPU model, or
+    # the spec clearly describes a training/inference WORKLOAD (not just mentions AI)
+    explicit_ml_workload_phrases = ["training workload", "model training", "gpu cluster",
+                                    "inference endpoint", "deep learning training",
+                                    "gpu instance", "gpu server"]
+    has_ml_workload = any(phrase in text_lower for phrase in explicit_ml_workload_phrases)
+
+    if has_explicit_gpu_requirement or has_ml_workload:
         req = SpecRequirement(
             category="GPU/ML",
             raw_description=_extract_context(original_text, ["gpu", "machine learning", "ai", "training", "inference"]),
@@ -1017,12 +1088,21 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── Containers ────────────────────────────────────────────────────────────
-    container_keywords = ["docker", "kubernetes", "k8s", "container", "pod", "microservice",
-                          "eks", "ecs", "fargate", "helm", "openshift"]
-    if any(kw in text_lower for kw in container_keywords):
+    # ONLY add containers if spec explicitly requires container ORCHESTRATION
+    # Mentioning "docker" alone or "container" in a description doesn't mean EKS/ECS is needed
+    explicit_orchestration_keywords = ["kubernetes cluster", "k8s cluster", "eks", "ecs cluster",
+                                       "container orchestration", "pod deployment", "helm chart",
+                                       "openshift", "fargate task", "microservices architecture"]
+    # Weak signals — only count if multiple are present
+    weak_container_signals = ["docker", "container", "kubernetes", "k8s", "pod", "microservice"]
+    
+    strong_container = any(kw in text_lower for kw in explicit_orchestration_keywords)
+    weak_count = sum(1 for kw in weak_container_signals if kw in text_lower)
+    
+    if strong_container or weak_count >= 3:
         req = SpecRequirement(
             category="Containers",
-            raw_description=_extract_context(original_text, container_keywords[:5]),
+            raw_description=_extract_context(original_text, ["docker", "kubernetes", "container", "pod", "microservice"]),
             quantity=1,
             unit="cluster",
             source_platform=platform,
@@ -1031,9 +1111,16 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── Serverless ────────────────────────────────────────────────────────────
-    serverless_keywords = ["lambda", "serverless", "function as a service", "faas", "event-driven",
-                           "api gateway", "rest api", "graphql api"]
-    if any(kw in text_lower for kw in serverless_keywords):
+    # Only if spec explicitly mentions serverless architecture or Lambda functions
+    explicit_serverless = ["serverless architecture", "lambda function", "function as a service",
+                           "faas", "event-driven architecture", "serverless compute"]
+    # "rest api" or "api gateway" alone is NOT enough — those can run on EC2 too
+    weak_serverless = ["lambda", "serverless", "api gateway"]
+    
+    strong_serverless = any(kw in text_lower for kw in explicit_serverless)
+    weak_serverless_count = sum(1 for kw in weak_serverless if kw in text_lower)
+    
+    if strong_serverless or weak_serverless_count >= 2:
         req = SpecRequirement(
             category="Serverless/API",
             raw_description=_extract_context(original_text, ["lambda", "serverless", "api", "function"]),
@@ -1045,9 +1132,17 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── Analytics / Data ──────────────────────────────────────────────────────
-    analytics_keywords = ["data warehouse", "analytics", "big data", "etl", "data lake", "redshift",
-                          "bigquery", "synapse", "spark", "hadoop", "emr", "glue", "kinesis", "streaming"]
-    if any(kw in text_lower for kw in analytics_keywords):
+    # Only if spec explicitly describes analytics/data processing workloads
+    explicit_analytics = ["data warehouse", "etl pipeline", "data lake", "big data processing",
+                          "streaming pipeline", "real-time analytics", "batch processing pipeline"]
+    # Weak: just mentioning "analytics" or "reporting" in a feature list isn't enough
+    weak_analytics = ["redshift", "bigquery", "synapse", "spark", "hadoop", "emr", 
+                      "glue", "kinesis", "data warehouse"]
+    
+    strong_analytics = any(kw in text_lower for kw in explicit_analytics)
+    weak_analytics_count = sum(1 for kw in weak_analytics if kw in text_lower)
+    
+    if strong_analytics or weak_analytics_count >= 2:
         req = SpecRequirement(
             category="Analytics/Data",
             raw_description=_extract_context(original_text, ["analytics", "data", "etl", "warehouse", "streaming"]),
@@ -1059,9 +1154,13 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
         requirements.append(req)
 
     # ── Security / Identity ───────────────────────────────────────────────────
-    security_keywords = ["active directory", "ldap", "identity", "iam", "sso", "secret", "certificate",
-                         "kms", "encryption", "compliance", "siem", "waf", "ddos"]
-    if any(kw in text_lower for kw in security_keywords):
+    # Only if spec explicitly requires security SERVICES (not just encryption or passwords)
+    explicit_security_services = ["active directory", "identity provider", "sso integration",
+                                  "waf deployment", "ddos protection", "siem", "security operations",
+                                  "certificate management", "secrets management", "key management"]
+    # "encryption" alone is a standard practice, not a separate requirement
+    
+    if any(kw in text_lower for kw in explicit_security_services):
         req = SpecRequirement(
             category="Security/Identity",
             raw_description=_extract_context(original_text, ["security", "identity", "encryption", "iam", "waf"]),
@@ -1069,6 +1168,16 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
             unit="service",
             source_platform=platform,
             notes="Security/Identity services required"
+        )
+        requirements.append(req)
+
+    # ── SaaS flag ─────────────────────────────────────────────────────────────
+    if is_saas_spec and not requirements:
+        req = SpecRequirement(
+            category="Unknown",
+            raw_description=original_text[:500],
+            source_platform=platform,
+            notes="This appears to be a SaaS/application requirement. Infrastructure mapping may not apply directly. Consider the application's hosting requirements instead."
         )
         requirements.append(req)
 
