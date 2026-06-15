@@ -44,6 +44,7 @@ class AWSServiceMapping:
     base_monthly_usd: float = 0.0  # us-east-1 price before region multiplier
     aws_calculator_url: str = ""
     region: str = "us-east-1"
+    reasoning: str = ""
 
 
 # ── Cloud vendor translation dictionaries ─────────────────────────────────────
@@ -1252,40 +1253,70 @@ def _map_compute(req: SpecRequirement, region: str = "us-east-1") -> AWSServiceM
             graviton_type = grav
 
     base_monthly = EC2_MONTHLY_PRICES.get(x86_type, 70.08) * req.quantity
-    monthly = apply_region(base_monthly, region)
+    
+    # Include EBS gp3 storage cost if disk space was mentioned in the spec
+    # (since we no longer create a separate Storage category for local disk)
+    ebs_cost = 0.0
+    disk_note = ""
+    raw_text = (req.raw_description or "").lower()
+    # Try to extract disk size from the raw spec text
+    disk_match = re.search(r'(\d+)\s*(gb|tb)\s*(?:disk|storage|ssd|hdd|nvme|space)', raw_text)
+    if not disk_match:
+        disk_match = re.search(r'(?:disk|storage|space)[:\s]+(\d+)\s*(gb|tb)', raw_text)
+    if disk_match:
+        disk_val = float(disk_match.group(1))
+        disk_unit = disk_match.group(2).lower()
+        disk_gb = disk_val if disk_unit == "gb" else disk_val * 1024
+        ebs_cost = disk_gb * EC2_MONTHLY_PRICES["ebs_gp3_per_gb"]
+        disk_note = f", EBS: {int(disk_gb)} GB gp3 included"
+
+    total_base = base_monthly + ebs_cost
+    monthly = apply_region(total_base, region)
+    
+    description = f"EC2 instance ({x86_type}) — {req.notes}{disk_note}"
+    if ebs_cost > 0:
+        description += f" | Includes EC2 + EBS storage"
+
+    # Build reasoning/justification
+    reasoning = f"Detected: {vcpu} vCPU, {ram_gb} GB RAM from spec."
+    if ebs_cost > 0:
+        reasoning += f" Includes {int(disk_gb)} GB EBS gp3 storage."
+    reasoning += f" Selected {x86_type} as the smallest instance meeting these requirements."
+    if req.quantity > 1:
+        reasoning += f" Quantity: {req.quantity} instances as specified."
+    else:
+        reasoning += " Single instance — no multi-instance or HA requirement detected."
 
     return AWSServiceMapping(
         requirement=req,
         service_name="Amazon EC2",
         service_code="AmazonEC2",
         recommended_type=x86_type,
-        description=f"General purpose compute instance — {req.notes}",
+        description=description,
         quantity=req.quantity,
         unit="instance",
         confidence="high" if vcpu > 0 and ram_gb > 0 else ("medium" if vcpu > 0 or ram_gb > 0 else "needs_info"),
         missing_info=missing,
         alternatives=[
             {"label": "Graviton3 (ARM, ~20% cheaper)", "type": graviton_type,
-             "monthly_usd": apply_region(EC2_MONTHLY_PRICES.get(graviton_type, 60.0) * req.quantity, region),
-             "base_monthly_usd": round(EC2_MONTHLY_PRICES.get(graviton_type, 60.0) * req.quantity, 2)},
+             "monthly_usd": apply_region(round((EC2_MONTHLY_PRICES.get(graviton_type, 60.0) * req.quantity + ebs_cost), 2), region),
+             "base_monthly_usd": round(EC2_MONTHLY_PRICES.get(graviton_type, 60.0) * req.quantity + ebs_cost, 2)},
             {"label": "Spot Instances (~70% cheaper, interruptible)", "type": f"{x86_type} Spot",
-             "monthly_usd": round(monthly * 0.3, 2),
-             "base_monthly_usd": round(base_monthly * 0.3, 2)},
-            {"label": "1-Year Reserved (No Upfront, ~30% cheaper)", "type": f"{x86_type} Reserved 1yr",
-             "monthly_usd": round(monthly * 0.70, 2),
-             "base_monthly_usd": round(base_monthly * 0.70, 2)},
-            {"label": "3-Year Reserved (No Upfront, ~45% cheaper)", "type": f"{x86_type} Reserved 3yr",
-             "monthly_usd": round(monthly * 0.55, 2),
-             "base_monthly_usd": round(base_monthly * 0.55, 2)},
-            {"label": "Savings Plans (Compute)", "type": f"{x86_type} Savings Plan",
-             "monthly_usd": round(monthly * 0.66, 2),
-             "base_monthly_usd": round(base_monthly * 0.66, 2)},
+             "monthly_usd": round(apply_region(base_monthly * 0.3 + ebs_cost, region), 2),
+             "base_monthly_usd": round(base_monthly * 0.3 + ebs_cost, 2)},
+            {"label": "1-Year Reserved (~30% savings on compute)", "type": f"{x86_type} Reserved 1yr",
+             "monthly_usd": round(apply_region(base_monthly * 0.70 + ebs_cost, region), 2),
+             "base_monthly_usd": round(base_monthly * 0.70 + ebs_cost, 2)},
+            {"label": "3-Year Reserved (~45% savings on compute)", "type": f"{x86_type} Reserved 3yr",
+             "monthly_usd": round(apply_region(base_monthly * 0.55 + ebs_cost, region), 2),
+             "base_monthly_usd": round(base_monthly * 0.55 + ebs_cost, 2)},
         ],
         pricing_options=get_pricing_models("AmazonEC2"),
         monthly_estimate_usd=round(monthly, 2),
-        base_monthly_usd=round(base_monthly, 2),
+        base_monthly_usd=round(total_base, 2),
         aws_calculator_url=get_calculator_url("AmazonEC2"),
         region=region,
+        reasoning=reasoning,
     )
 
 
@@ -1385,7 +1416,29 @@ def _map_database(req: SpecRequirement, region: str = "us-east-1") -> AWSService
     engine = getattr(req, "_db_engine", "unspecified").lower()
     missing = []
 
-    engine_map = {
+    # ── Determine if this is a simple single-instance DB or a managed service need ──
+    # For a single server with a DB (like "Database: MongoDB" on one machine),
+    # the best AWS solution is often EC2 self-managed, NOT a managed service.
+    # Managed services (RDS, DocumentDB) are best when:
+    # - HA/Multi-AZ is needed
+    # - Multiple replicas are specified
+    # - "managed" or "serverless" is mentioned
+    # - No specific OS requirement (managed services abstract the OS)
+    
+    text_lower = req.raw_description.lower() if req.raw_description else ""
+    notes_lower = req.notes.lower() if req.notes else ""
+    
+    needs_managed = any(kw in text_lower or kw in notes_lower for kw in [
+        "high availability", "multi-az", "replica", "cluster", "managed",
+        "serverless", "automated backup", "auto-scaling", "read replica"
+    ])
+    
+    # If it's a simple single-instance DB on a server, recommend EC2 self-managed
+    is_simple_single_instance = not needs_managed
+
+    # ── Engine-specific mapping ───────────────────────────────────────────────
+    # Managed service options (for when HA/managed is needed)
+    managed_engine_map = {
         "postgresql": ("Amazon RDS for PostgreSQL", "AmazonRDS", "db.m6i.large", EC2_MONTHLY_PRICES["rds_postgres_per_hour"] * 730),
         "postgres": ("Amazon RDS for PostgreSQL", "AmazonRDS", "db.m6i.large", EC2_MONTHLY_PRICES["rds_postgres_per_hour"] * 730),
         "mysql": ("Amazon RDS for MySQL", "AmazonRDS", "db.m6i.large", EC2_MONTHLY_PRICES["rds_mysql_per_hour"] * 730),
@@ -1400,62 +1453,108 @@ def _map_database(req: SpecRequirement, region: str = "us-east-1") -> AWSService
         "dynamodb": ("Amazon DynamoDB", "AmazonDynamoDB", "Provisioned / On-Demand", 25.0),
     }
 
-    if engine in engine_map:
-        svc_name, svc_code, rec_type, monthly = engine_map[engine]
+    # Self-managed on EC2 options (simpler, cheaper for single instances)
+    selfmanaged_engine_map = {
+        "postgresql": ("Amazon EC2 (self-managed PostgreSQL)", "AmazonEC2", "m6i.large", 70.08),
+        "postgres": ("Amazon EC2 (self-managed PostgreSQL)", "AmazonEC2", "m6i.large", 70.08),
+        "mysql": ("Amazon EC2 (self-managed MySQL)", "AmazonEC2", "m6i.large", 70.08),
+        "mariadb": ("Amazon EC2 (self-managed MariaDB)", "AmazonEC2", "m6i.large", 70.08),
+        "mongodb": ("Amazon EC2 (self-managed MongoDB)", "AmazonEC2", "m6i.xlarge", 140.16),
+        "redis": ("Amazon EC2 (self-managed Redis)", "AmazonEC2", "r6i.large", 100.0),
+        "cassandra": ("Amazon EC2 (self-managed Cassandra)", "AmazonEC2", "m6i.xlarge", 140.16),
+        "elasticsearch": ("Amazon EC2 (self-managed Elasticsearch)", "AmazonEC2", "r6i.large", 100.0),
+    }
+
+    if is_simple_single_instance and engine in selfmanaged_engine_map:
+        # Recommend self-managed (cheaper, simpler for single-instance)
+        svc_name, svc_code, rec_type, monthly = selfmanaged_engine_map[engine]
         confidence = "high"
+        description = f"Self-managed {engine} on EC2 — best for single-instance, cost-optimized deployments"
+        
+        # Offer managed service as an alternative
+        if engine in managed_engine_map:
+            managed = managed_engine_map[engine]
+            alts = [
+                {"label": f"{managed[0]} (managed, HA-ready)", "type": managed[2],
+                 "monthly_usd": apply_region(round(managed[3], 2), region),
+                 "base_monthly_usd": round(managed[3], 2)},
+                {"label": "Graviton EC2 (~20% cheaper)", "type": rec_type.replace("m6i", "m7g").replace("r6i", "r7g"),
+                 "monthly_usd": apply_region(round(monthly * 0.80, 2), region),
+                 "base_monthly_usd": round(monthly * 0.80, 2)},
+                {"label": "Reserved 1yr (~30% savings)", "type": f"{rec_type} Reserved 1yr",
+                 "monthly_usd": apply_region(round(monthly * 0.70, 2), region),
+                 "base_monthly_usd": round(monthly * 0.70, 2)},
+            ]
+        else:
+            alts = []
+    elif engine in managed_engine_map:
+        svc_name, svc_code, rec_type, monthly = managed_engine_map[engine]
+        confidence = "high"
+        description = f"Managed database service — Engine: {engine}"
+        alts = [
+            {"label": "Multi-AZ (high availability, ~2x cost)", "type": f"{rec_type} Multi-AZ",
+             "monthly_usd": apply_region(round(monthly * 2, 2), region),
+             "base_monthly_usd": round(monthly * 2, 2)},
+            {"label": "Reserved Instance 1yr (~30% savings)", "type": f"{rec_type} Reserved 1yr",
+             "monthly_usd": apply_region(round(monthly * 0.70, 2), region),
+             "base_monthly_usd": round(monthly * 0.70, 2)},
+            {"label": "Graviton-based (~20% cheaper)", "type": "db.m7g.large",
+             "monthly_usd": apply_region(round(monthly * 0.80, 2), region),
+             "base_monthly_usd": round(monthly * 0.80, 2)},
+        ]
+        # For engines that can also be self-managed, add that as a cheaper alt
+        if engine in selfmanaged_engine_map:
+            sm = selfmanaged_engine_map[engine]
+            alts.insert(0, {"label": f"EC2 self-managed (cheaper, no managed overhead)", "type": sm[2],
+                            "monthly_usd": apply_region(round(sm[3], 2), region),
+                            "base_monthly_usd": round(sm[3], 2)})
     elif engine == "unspecified":
         svc_name = "Amazon RDS"
         svc_code = "AmazonRDS"
         rec_type = "db.m6i.large"
         monthly = EC2_MONTHLY_PRICES["rds_mysql_per_hour"] * 730
         confidence = "needs_info"
-        missing = ["Database engine type (MySQL, PostgreSQL, SQL Server, Oracle, etc.)",
+        description = "Database service — engine unspecified"
+        missing = ["Database engine type (MySQL, PostgreSQL, SQL Server, Oracle, MongoDB, etc.)",
                    "Database size and instance sizing requirements"]
+        alts = []
     else:
         svc_name = "Amazon RDS"
         svc_code = "AmazonRDS"
         rec_type = "db.m6i.large"
         monthly = EC2_MONTHLY_PRICES["rds_mysql_per_hour"] * 730
         confidence = "medium"
+        description = f"Database service — Engine: {engine}"
         missing.append("Confirm engine compatibility with Amazon RDS")
+        alts = []
 
-    if not missing and engine not in ("unspecified",):
-        if "size" not in req.notes.lower() and req.value == 0:
-            missing.append("Database instance size (vCPU/RAM requirements)")
-
-    alts = [
-        {"label": "Amazon Aurora (MySQL/PostgreSQL compatible, higher performance)", "type": "Aurora",
-         "monthly_usd": apply_region(round(monthly * 1.2, 2), region),
-         "base_monthly_usd": round(monthly * 1.2, 2)},
-        {"label": "Multi-AZ (high availability, ~2x cost)", "type": f"{rec_type} Multi-AZ",
-         "monthly_usd": apply_region(round(monthly * 2, 2), region),
-         "base_monthly_usd": round(monthly * 2, 2)},
-        {"label": "Reserved Instance 1yr (~30% savings)", "type": f"{rec_type} Reserved 1yr",
-         "monthly_usd": apply_region(round(monthly * 0.70, 2), region),
-         "base_monthly_usd": round(monthly * 0.70, 2)},
-        {"label": "Graviton-based instance (~20% cheaper)", "type": "db.m7g.large",
-         "monthly_usd": apply_region(round(monthly * 0.80, 2), region),
-         "base_monthly_usd": round(monthly * 0.80, 2)},
-    ]
+    # Build reasoning/justification
+    if is_simple_single_instance and engine in selfmanaged_engine_map:
+        reasoning = f"Detected: {engine} database. Single-instance deployment (no HA/cluster/managed keywords found). Recommended self-managed on EC2 for cost efficiency. Managed service ({managed_engine_map.get(engine, ('',))[0]}) available as alternative if HA is needed later."
+    elif engine in managed_engine_map and not is_simple_single_instance:
+        reasoning = f"Detected: {engine} database with managed/HA requirements. Recommended {svc_name} for automated backups, patching, and high availability."
+    elif engine == "unspecified":
+        reasoning = "Database engine not specified in the spec. Please provide the engine type for a more accurate recommendation."
+    else:
+        reasoning = f"Detected: {engine} database. Mapped to {svc_name} as the closest AWS equivalent."
 
     return AWSServiceMapping(
         requirement=req,
         service_name=svc_name,
         service_code=svc_code,
         recommended_type=rec_type,
-        description=f"Managed database service — Engine: {engine}",
+        description=description,
         quantity=req.quantity,
         unit="instance",
         confidence=confidence,
         missing_info=missing,
-        alternatives=[{"label": a["label"], "type": a["type"],
-                       "monthly_usd": a["monthly_usd"],
-                       "base_monthly_usd": a["base_monthly_usd"]} for a in alts],
+        alternatives=alts,
         pricing_options=get_pricing_models(svc_code),
         monthly_estimate_usd=apply_region(round(monthly, 2), region),
         base_monthly_usd=round(monthly, 2),
         aws_calculator_url=get_calculator_url(svc_code),
         region=region,
+        reasoning=reasoning,
     )
 
 
@@ -1501,6 +1600,11 @@ def _map_networking(req: SpecRequirement, region: str = "us-east-1") -> AWSServi
 
     monthly = apply_region(base_monthly, region)
 
+    # Build reasoning/justification
+    reasoning = f"Detected explicit networking services: {', '.join(services)}."
+    if bandwidth_gbps > 0:
+        reasoning += f" Bandwidth requirement: {bandwidth_gbps} Gbps."
+
     return AWSServiceMapping(
         requirement=req,
         service_name=", ".join(services[:2]) if services else "Amazon VPC",
@@ -1527,6 +1631,7 @@ def _map_networking(req: SpecRequirement, region: str = "us-east-1") -> AWSServi
         base_monthly_usd=round(base_monthly, 2),
         aws_calculator_url=get_calculator_url("ElasticLoadBalancing"),
         region=region,
+        reasoning=reasoning,
     )
 
 
@@ -1774,6 +1879,7 @@ def _map_security(req: SpecRequirement, region: str = "us-east-1") -> AWSService
 
 
 def _map_unknown(req: SpecRequirement) -> AWSServiceMapping:
+    reasoning = "No specific infrastructure requirements could be extracted from the text. Please provide more details about compute, storage, database, or networking needs."
     return AWSServiceMapping(
         requirement=req,
         service_name="AWS (service undetermined)",
@@ -1794,6 +1900,7 @@ def _map_unknown(req: SpecRequirement) -> AWSServiceMapping:
         monthly_estimate_usd=0.0,
         base_monthly_usd=0.0,
         aws_calculator_url="https://calculator.aws/#/createCalculator",
+        reasoning=reasoning,
     )
 
 
@@ -1821,6 +1928,8 @@ def _mapping_to_dict(m: AWSServiceMapping) -> dict:
         "raw_description": m.requirement.raw_description[:300],
         "notes": m.requirement.notes,
         "source_platform": m.requirement.source_platform,
+        "reasoning": m.reasoning,
+        "extracted_requirement": m.requirement.raw_description[:500],
         # User-selectable fields (defaults)
         "selected_type": m.recommended_type,
         "selected_pricing": m.pricing_options[0] if m.pricing_options else "On-Demand",

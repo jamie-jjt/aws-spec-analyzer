@@ -388,6 +388,34 @@ textarea#text-input:focus {
   max-height: 80px; overflow-y: auto;
 }
 
+/* ── Reasoning Panel ──────────────────────────────────────────────────── */
+.bom-reasoning {
+  background: #F8FFF8;
+  border: 1px solid #C8E6C9;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.reason-extract {
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px dotted #C8E6C9;
+}
+
+.reason-quote {
+  font-family: "Menlo", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.reason-why {
+  color: var(--text);
+}
+
 /* ── Controls inside BOM row ──────────────────────────────────────────── */
 .bom-controls {
   display: flex; flex-wrap: wrap; gap: 12px;

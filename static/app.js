@@ -514,6 +514,21 @@ function renderBOM() {
       ? `[Manually added] ${mapping.notes || ""}`
       : `[${mapping.source_platform || ""}] ${mapping.notes || mapping.raw_description || ""}`;
 
+    // Reasoning/justification panel
+    if (mapping.reasoning || mapping.extracted_requirement) {
+      const reasonDiv = document.createElement("div");
+      reasonDiv.className = "bom-reasoning";
+      let reasonHtml = "";
+      if (mapping.extracted_requirement) {
+        reasonHtml += `<div class="reason-extract"><strong>📄 From spec:</strong> <span class="reason-quote">"${escHtml(mapping.extracted_requirement.substring(0, 300))}"</span></div>`;
+      }
+      if (mapping.reasoning) {
+        reasonHtml += `<div class="reason-why"><strong>💡 Why this service:</strong> ${escHtml(mapping.reasoning)}</div>`;
+      }
+      reasonDiv.innerHTML = reasonHtml;
+      const specText = row.querySelector(".bom-spec-text");
+      specText.parentNode.insertBefore(reasonDiv, specText.nextSibling);
+    }
     // Quantity
     const qtyInput = row.querySelector(".ctrl-qty");
     qtyInput.value = mapping.selected_quantity || mapping.quantity || 1;
