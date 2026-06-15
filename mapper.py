@@ -827,6 +827,36 @@ def _translate_vendor_terms(text: str) -> str:
     return result
 
 
+def _is_it_infrastructure_context(text_lower: str) -> bool:
+    """
+    Validate that the text is actually about IT/computing infrastructure,
+    not about irrigation, water storage, civil engineering, etc.
+    Returns True if the text appears to be about IT infrastructure.
+    """
+    # Strong IT indicators — if these appear, it's likely an IT spec
+    strong_it_signals = ["cpu", "vcpu", "ram", "server", "virtual machine", "database",
+                         "operating system", "linux", "windows server", "ubuntu",
+                         "ip address", "ipv4", "ipv6", "bandwidth", "mbps", "gbps",
+                         "disk space", "ssd", "hdd", "nvme", "iops",
+                         "cloud", "aws", "azure", "gcp", "vmware", "docker",
+                         "postgresql", "mysql", "mongodb", "redis", "sql server",
+                         "api", "http", "https", "ssl", "dns", "firewall"]
+    
+    # Non-IT signals — documents about civil engineering, agriculture, etc.
+    non_it_signals = ["irrigation", "flood control", "drainage", "water supply",
+                      "sanitation", "sewerage", "solid waste", "civil engineering",
+                      "construction", "bridge", "road", "building permit",
+                      "agricultural", "farming", "livestock", "harvest"]
+    
+    it_score = sum(1 for kw in strong_it_signals if kw in text_lower)
+    non_it_score = sum(1 for kw in non_it_signals if kw in text_lower)
+    
+    # If more non-IT signals than IT signals, this isn't an IT infrastructure spec
+    if non_it_score > it_score and it_score < 3:
+        return False
+    return it_score >= 2
+
+
 def _extract_requirements(original_text: str, translated_text: str, platform: str) -> List[SpecRequirement]:
     """
     Intelligently extract infrastructure requirements from spec text.
@@ -838,9 +868,26 @@ def _extract_requirements(original_text: str, translated_text: str, platform: st
     - Keywords like "docker" or "container" in a description don't mean container orchestration is needed
     - GPU mentioned in passing doesn't mean GPU instances are needed
     - Detect SaaS/application patterns that don't map to raw AWS infrastructure
+    - Validate that detected keywords are in an IT context (not civil engineering, agriculture, etc.)
     """
     requirements = []
     text_lower = original_text.lower()
+
+    # ── Context validation ────────────────────────────────────────────────────
+    # Check if this text is actually about IT infrastructure
+    is_it_context = _is_it_infrastructure_context(text_lower)
+    
+    if not is_it_context:
+        # Document doesn't appear to be about IT infrastructure
+        req = SpecRequirement(
+            category="Unknown",
+            raw_description=original_text[:500],
+            source_platform=platform,
+            notes="This document does not appear to contain IT infrastructure specifications. "
+                  "It may be about civil engineering, agriculture, or another non-IT domain. "
+                  "If there is an IT section, try uploading only the relevant pages."
+        )
+        return [req]
 
     # ── SaaS / Application Detection ─────────────────────────────────────────
     # If the spec describes a SaaS product/application (not infrastructure), flag it
@@ -1206,17 +1253,57 @@ def _has_storage_keywords(text: str) -> bool:
     return any(kw in text for kw in keywords)
 
 
-def _extract_context(text: str, keywords: List[str], window: int = 200) -> str:
-    """Find first keyword occurrence and return surrounding text."""
+def _extract_context(text: str, keywords: List[str], window: int = 300) -> str:
+    """
+    Find the BEST keyword occurrence and return surrounding text.
+    Prefers occurrences that are near other infrastructure-related terms,
+    not just the first random match in an unrelated paragraph.
+    """
     text_lower = text.lower()
+    
+    # Infrastructure context words that indicate the surrounding text is actually about infra
+    infra_context_words = ["cpu", "vcpu", "core", "ram", "memory", "gb", "tb", "server",
+                           "instance", "database", "storage", "disk", "network", "bandwidth",
+                           "mbps", "gbps", "vm", "virtual", "os:", "operating system",
+                           "iops", "cluster", "node", "ip", "port"]
+    
+    best_snippet = ""
+    best_score = -1
+    
     for kw in keywords:
-        idx = text_lower.find(kw)
-        if idx >= 0:
-            start = max(0, idx - window // 2)
-            end = min(len(text), idx + window // 2)
-            snippet = text[start:end].strip()
-            return snippet if snippet else text[:window]
-    return text[:window]
+        # Find ALL occurrences of this keyword
+        start_idx = 0
+        while True:
+            idx = text_lower.find(kw, start_idx)
+            if idx < 0:
+                break
+            
+            # Get surrounding window
+            snip_start = max(0, idx - window // 2)
+            snip_end = min(len(text), idx + window // 2)
+            snippet = text[snip_start:snip_end].strip()
+            snippet_lower = snippet.lower()
+            
+            # Score this snippet by how many infrastructure context words it contains
+            score = sum(1 for cw in infra_context_words if cw in snippet_lower)
+            
+            if score > best_score:
+                best_score = score
+                best_snippet = snippet
+            
+            start_idx = idx + len(kw)
+    
+    # If no good context found (score 0 = keyword appeared in unrelated text), 
+    # return empty rather than misleading text
+    if best_score < 2:
+        # Try to find any line with actual numbers + units (likely a spec table row)
+        for line in text.split("\n"):
+            line_lower = line.lower().strip()
+            if any(cw in line_lower for cw in infra_context_words) and re.search(r'\d+', line_lower):
+                return line.strip()[:400]
+        return ""
+    
+    return best_snippet if best_snippet else ""
 
 
 def _map_requirement(req: SpecRequirement, region: str = "us-east-1") -> AWSServiceMapping:
@@ -1929,7 +2016,7 @@ def _mapping_to_dict(m: AWSServiceMapping) -> dict:
         "notes": m.requirement.notes,
         "source_platform": m.requirement.source_platform,
         "reasoning": m.reasoning,
-        "extracted_requirement": m.requirement.raw_description[:500],
+        "extracted_requirement": m.requirement.raw_description[:500] if m.requirement.raw_description.strip() else "",
         # User-selectable fields (defaults)
         "selected_type": m.recommended_type,
         "selected_pricing": m.pricing_options[0] if m.pricing_options else "On-Demand",
